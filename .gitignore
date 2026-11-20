@@ -6,3 +6,4 @@ test/*
 *.gz
 *.fastq*
 *workflow/data/*
+CLAUDE.md

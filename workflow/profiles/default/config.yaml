@@ -1,0 +1,7 @@
+# Loaded automatically by Snakemake (>= 8) for this workflow; command-line options override these.
+software-deployment-method: conda
+cores: 32
+# Total memory (MB) Snakemake may schedule across concurrently running jobs.
+# Set to ~80% of the machine's RAM, or what you're allowed to use on a shared server.
+resources:
+  mem_mb: 100000

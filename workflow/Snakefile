@@ -108,6 +108,8 @@ rule liftoff:
     params:
         tmpdir=f"{RESOURCES_DIR}/liftoff_intermediate"
     threads: 32
+    resources:
+        mem_mb=60000
     log:
         "logs/liftoff.out"
     conda: "envs/liftoff.yaml"
@@ -149,6 +151,8 @@ rule splitcode_filter:
     log:
         "logs/splitcode_filter_{sample}.out"
     threads: 16
+    resources:
+        mem_mb=16000
     conda: "envs/splitcode.yaml"
     shell:
         """
@@ -188,6 +192,7 @@ rule concatenate_fastq:
 rule correct_barcodes:
     input:
         config = f"{CONFIG_DIR}/config-correct.txt",
+        onlists = expand(f"{CONFIG_DIR}/onlists/{{f}}", f=["r1_R.txt", "r1_T.txt", "r2_3.txt"]),
         barcode_fastq = f"{SPLITCODE_DIR}/{{sample}}/barcode.fastq.gz",
         cdna_fastq = f"{SPLITCODE_DIR}/{{sample}}/cDNA.fastq.gz",
         umi_fastq = f"{SPLITCODE_DIR}/{{sample}}/umi.fastq.gz"
@@ -198,13 +203,20 @@ rule correct_barcodes:
         # uncorrected barcodes of the kept reads; splitcode 0.31.6 rejects --select with fewer outputs than inputs
         filtered_fastq = temp(f"{SPLITCODE_DIR}/{{sample}}/barcode_filtered.fastq.gz")
     params:
-        outdir = f"{SPLITCODE_DIR}/{{sample}}"
+        outdir = f"{SPLITCODE_DIR}/{{sample}}",
+        onlist_dir = f"{CONFIG_DIR}/onlists"
     threads: 16
+    resources:
+        mem_mb=8000
     log: "logs/correct_barcodes_{sample}.out"
     conda: "envs/splitcode.yaml"
     shell:
-        """
-        config=$(realpath {input.config})
+        r"""
+        # config-correct.txt names the onlists without a directory; give splitcode a copy with full paths
+        config=$(mktemp)
+        trap 'rm -f "$config"' EXIT
+        sed -E "s#^([^[:space:]]+\.txt[$])#{params.onlist_dir}/\1#" {input.config} > "$config"
+
         cdna_fastq=$(realpath {input.cdna_fastq})
         umi_fastq=$(realpath {input.umi_fastq})
         barcode_fastq=$(realpath {input.barcode_fastq})
@@ -220,6 +232,8 @@ rule merge_tags:
         barcode_fastq = f"{SPLITCODE_DIR}/{{sample}}/barcode_corrected.fastq.gz"
     output: f"{SPLITCODE_DIR}/{{sample}}/barcode_merged.fastq.gz"
     threads: 16
+    resources:
+        mem_mb=4000
     log: "logs/merge_tags_{sample}.out"
     conda: "envs/splitcode.yaml"
     shell:
@@ -239,6 +253,8 @@ rule star_index:
         # overhang = R1 length (140 bp) - 1
         sjdb=f"--sjdbGTFfile {ANNOTATION_GTF} --sjdbOverhang 139" if ANNOTATION_GTF else ""
     threads: 16
+    resources:
+        mem_mb=40000
     log:
         "logs/star_index.out"
     conda: "envs/star.yaml"
@@ -260,6 +276,8 @@ rule star_junctions:
         prefix=f"{STAR_DIR}/",
         reads=",".join(SHORT_READS_R1)
     threads: 16
+    resources:
+        mem_mb=40000
     log:
         "logs/star_junctions.out"
     conda: "envs/star.yaml"
@@ -283,6 +301,8 @@ rule genome_align:
     params:
         prefix=f"{FLAIR_DIR}/flair.aligned"
     threads: 32
+    resources:
+        mem_mb=32000
     log:
         "logs/genome_align.out"
     conda: "envs/flair.yaml"
@@ -306,6 +326,8 @@ rule build_transcriptome:
         prefix=f"{FLAIR_DIR}/flair",
         annotation=f"-f {ANNOTATION_GTF}" if ANNOTATION_GTF else ""
     threads: 32
+    resources:
+        mem_mb=32000
     log:
         "logs/build_transcriptome.out"
     conda: "envs/flair.yaml"
@@ -325,6 +347,8 @@ rule kallisto_index:
         t2g=f"{KALLISTO_DIR}/t2g.txt",
         fasta=temp(f"{KALLISTO_DIR}/fasta.fa")
     threads: 32
+    resources:
+        mem_mb=32000
     log:
         "logs/kallisto_index.out"
     conda: "envs/kb_python.yaml"
@@ -344,6 +368,8 @@ rule kallisto_count:
     output:
         dir=directory(f"{KALLISTO_DIR}/{{sample}}")
     threads: 16
+    resources:
+        mem_mb=16000
     log:
         "logs/kallisto_count_{sample}.out"
     conda: "envs/kb_python.yaml"

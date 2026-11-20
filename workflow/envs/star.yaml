@@ -3,4 +3,6 @@ channels:
   - bioconda
   - nodefaults
 dependencies:
-  - star=2.7.11b
+  # 2.7.11b (bioconda) crashes with "Illegal instruction" on older CPUs without AVX2
+  # (e.g. Xeon E5-2690 v1); 2.7.11a runs on them
+  - star=2.7.11a

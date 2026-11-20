@@ -1,0 +1,356 @@
+import os
+
+# Run from the repository root (8cube_isoform/): snakemake finds workflow/Snakefile on its own.
+# Inputs are read from workflow/configs, outputs are written to resources/, results/ and logs/.
+
+# Change to wherever the 8cube run is stored (or override with --config run_dir=...)
+RUN_DIR = os.path.join(config.get("run_dir", "/home/8cube/raw_data/igvf_010/"), "")
+DATA_DIR = RUN_DIR + "nanopore/"
+
+# Each fastq in DATA_DIR is its own sample (sublibraries/runs are never merged)
+SAMPLES, = glob_wildcards(DATA_DIR + "{sample,[^/]+}.fastq.gz")
+
+# Illumina R1 (cDNA) reads from every nova* directory, used for short-read splice junctions.
+# R2 only holds the UMI/barcodes, so it isn't needed.
+NOVA_RUNS, NOVA_LIBS = glob_wildcards(RUN_DIR + "{run,nova[^/]*}/{lib,[^/]+}L001_R1_001.fastq.gz")
+SHORT_READS_R1 = sorted(expand(RUN_DIR + "{run}/{lib}L001_R1_001.fastq.gz", zip, run=NOVA_RUNS, lib=NOVA_LIBS))
+
+# Directories
+CONFIG_DIR = os.path.join(workflow.basedir, "configs")
+RESOURCES_DIR = "resources"
+SPLITCODE_DIR = "results/splitcode"
+STAR_DIR = "results/star"
+FLAIR_DIR = "results/flair"
+KALLISTO_DIR = "results/kallisto"
+
+# C57BL/6 T2T genome (T2T_mhaESC_v1.5: chr1-19, X, Y, MT). NCBI has no annotation for it,
+# so GENCODE is lifted over from GRCm39.
+T2T_ACCESSION = "GCA_056825265.1"
+GENOME = f"{RESOURCES_DIR}/genome/t2t.fna"
+
+GENCODE_RELEASE = "M39"
+GENCODE_GENOME = f"{RESOURCES_DIR}/gencode/GRCm39.primary_assembly.genome.fa"
+GENCODE_GTF = f"{RESOURCES_DIR}/gencode/gencode.v{GENCODE_RELEASE}.primary_assembly.annotation.gtf"
+
+# GTF used by STAR and FLAIR; set to None to run both without an annotation (skips liftoff)
+ANNOTATION_GTF = f"{RESOURCES_DIR}/genome/t2t_liftoff.gtf"
+
+# General parameters for splitcode filtering
+SEQUENCES = ["cDNA", "umi", "barcode"]
+DIRECTIONS = ["f", "rc"]
+
+wildcard_constraints:
+    sample="[^/]+"
+
+rule all:
+    input:
+        expand(f"{KALLISTO_DIR}/{{sample}}", sample=SAMPLES)
+
+#---------- Get Genome Reference ----------#
+
+rule reference_download:
+    output: GENOME
+    params:
+        acc=T2T_ACCESSION,
+        outdir=f"{RESOURCES_DIR}/genome"
+    log:
+        "logs/reference_download.out"
+    conda: "envs/datasets.yaml"
+    shell:
+        """
+        (datasets download genome accession {params.acc} --include genome --filename {params.outdir}/t2t.zip &&
+         unzip -o {params.outdir}/t2t.zip -d {params.outdir}/t2t_unzipped &&
+         cp {params.outdir}/t2t_unzipped/ncbi_dataset/data/{params.acc}/*.fna {output} &&
+         rm -rf {params.outdir}/t2t.zip {params.outdir}/t2t_unzipped) > {log} 2>&1
+        """
+
+rule gencode_download:
+    output:
+        genome=GENCODE_GENOME,
+        gtf=GENCODE_GTF
+    params:
+        url=f"https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_{GENCODE_RELEASE}",
+        release=GENCODE_RELEASE
+    log:
+        "logs/gencode_download.out"
+    shell:
+        """
+        (curl -sSfL {params.url}/GRCm39.primary_assembly.genome.fa.gz | gunzip -c > {output.genome} &&
+         curl -sSfL {params.url}/gencode.v{params.release}.primary_assembly.annotation.gtf.gz | gunzip -c > {output.gtf}) 2> {log}
+        """
+
+# GENCODE chromosome name -> T2T GenBank accession (e.g. chr1,CP000001.1), so liftoff
+# aligns each chromosome only to its counterpart
+rule t2t_chrom_map:
+    output: f"{RESOURCES_DIR}/genome/chroms.csv"
+    params:
+        acc=T2T_ACCESSION
+    log:
+        "logs/t2t_chrom_map.out"
+    conda: "envs/datasets.yaml"
+    shell:
+        """
+        (datasets summary genome accession {params.acc} --report sequence --as-json-lines \
+            | dataformat tsv genome-seq --fields chr-name,genbank-seq-acc,role \
+            | awk -F'\\t' 'NR > 1 && $3 == "assembled-molecule" {{ print ($1 == "MT" ? "chrM" : "chr" $1) "," $2 }}' \
+            > {output}) 2> {log}
+        """
+
+rule liftoff:
+    input:
+        target_genome=GENOME,
+        ref_genome=GENCODE_GENOME,
+        gtf=GENCODE_GTF,
+        chroms=f"{RESOURCES_DIR}/genome/chroms.csv"
+    output:
+        gtf=ANNOTATION_GTF,
+        unmapped=f"{RESOURCES_DIR}/genome/t2t_liftoff_unmapped.txt"
+    params:
+        tmpdir=f"{RESOURCES_DIR}/liftoff_intermediate"
+    threads: 32
+    log:
+        "logs/liftoff.out"
+    conda: "envs/liftoff.yaml"
+    shell:
+        """
+        (liftoff -g {input.gtf} -chroms {input.chroms} -o {output.gtf} -u {output.unmapped} \
+            -dir {params.tmpdir} -p {threads} {input.target_genome} {input.ref_genome} &&
+         rm -rf {params.tmpdir}) > {log} 2>&1
+        """
+
+#---------- Process Nanopore Data ----------#
+
+rule generate_config:
+    input:
+        ont_seqspec=f"{CONFIG_DIR}/nanopore-seqspec.yaml"
+    output:
+        ont_config=f"{SPLITCODE_DIR}/ONT.config"
+    log:
+        "logs/generate_config.out"
+    conda: "envs/seqspec.yaml"
+    shell:
+        """
+        (seqspec index -m rna -s read -i nanopore_read -t splitcode {input.ont_seqspec} > {output.ont_config} &&
+         sed -i -E '/<~c_|<r_/d; /\tlinker-[0-9]+[cr]\t/d' {output.ont_config}) 2> {log}
+        """
+
+def get_fastq_path(wildcards):
+    return DATA_DIR + f"{wildcards.sample}.fastq.gz"
+
+rule splitcode_filter:
+    input:
+        ont_config=f"{SPLITCODE_DIR}/ONT.config",
+        fastq=get_fastq_path
+    output:
+        temp(expand(SPLITCODE_DIR + "/{{sample}}/{direction}_{sequence}.fastq.gz",
+            direction=DIRECTIONS, sequence=SEQUENCES))
+    params:
+        outdir=SPLITCODE_DIR + "/{sample}"
+    log:
+        "logs/splitcode_filter_{sample}.out"
+    threads: 16
+    conda: "envs/splitcode.yaml"
+    shell:
+        """
+        config=$(realpath {input.ont_config})
+        fastq=$(realpath {input.fastq})
+        (cd {params.outdir} && splitcode --x-only --gzip --no-outb -c "$config" -t {threads} "$fastq") > {log} 2>&1
+        """
+
+rule reorient_barcodes:
+    input: f"{SPLITCODE_DIR}/{{sample}}/rc_barcode.fastq.gz"
+    output: temp(f"{SPLITCODE_DIR}/{{sample}}/rc_barcode_reoriented.fastq.gz")
+    threads: 16
+    log: "logs/reorient_barcodes_{sample}.out"
+    conda: "envs/pigz.yaml"
+    shell:
+        """
+        (pigz -dc {input} \
+            | awk 'NR % 2 == 0 {{ $0 = substr($0, 17, 8) substr($0, 9, 8) substr($0, 1, 8) }} {{ print }}' \
+            | pigz -p {threads} > {output}) 2> {log}
+        """
+
+def get_rc_input(wildcards):
+    suffix = "_reoriented" if wildcards.sequence == "barcode" else ""
+    return f"{SPLITCODE_DIR}/{wildcards.sample}/rc_{wildcards.sequence}{suffix}.fastq.gz"
+
+rule concatenate_fastq:
+    input:
+        f=f"{SPLITCODE_DIR}/{{sample}}/f_{{sequence}}.fastq.gz",
+        rc=get_rc_input,
+    output: temp(f"{SPLITCODE_DIR}/{{sample}}/{{sequence}}.fastq.gz")
+    wildcard_constraints:
+        sequence="|".join(SEQUENCES)
+    log: "logs/concatenate_fastq_{sample}_{sequence}.out"
+    shell:
+        "cat {input.f} {input.rc} > {output} 2> {log}"
+
+rule correct_barcodes:
+    input:
+        config = f"{CONFIG_DIR}/config-correct.txt",
+        barcode_fastq = f"{SPLITCODE_DIR}/{{sample}}/barcode.fastq.gz",
+        cdna_fastq = f"{SPLITCODE_DIR}/{{sample}}/cDNA.fastq.gz",
+        umi_fastq = f"{SPLITCODE_DIR}/{{sample}}/umi.fastq.gz"
+    output:
+        barcode_fastq = temp(f"{SPLITCODE_DIR}/{{sample}}/barcode_corrected.fastq.gz"),
+        cdna_fastq = f"{SPLITCODE_DIR}/{{sample}}/cDNA_corrected.fastq.gz",
+        umi_fastq = f"{SPLITCODE_DIR}/{{sample}}/umi_corrected.fastq.gz",
+        # uncorrected barcodes of the kept reads; splitcode 0.31.6 rejects --select with fewer outputs than inputs
+        filtered_fastq = temp(f"{SPLITCODE_DIR}/{{sample}}/barcode_filtered.fastq.gz")
+    params:
+        outdir = f"{SPLITCODE_DIR}/{{sample}}"
+    threads: 16
+    log: "logs/correct_barcodes_{sample}.out"
+    conda: "envs/splitcode.yaml"
+    shell:
+        """
+        config=$(realpath {input.config})
+        cdna_fastq=$(realpath {input.cdna_fastq})
+        umi_fastq=$(realpath {input.umi_fastq})
+        barcode_fastq=$(realpath {input.barcode_fastq})
+        (cd {params.outdir} && \
+         splitcode -c "$config" --nFastqs=3 -t {threads} --gzip \
+            -o cDNA_corrected.fastq.gz,umi_corrected.fastq.gz,barcode_filtered.fastq.gz \
+            "$cdna_fastq" "$umi_fastq" "$barcode_fastq") > {log} 2>&1
+        """
+
+rule merge_tags:
+    input:
+        config = f"{CONFIG_DIR}/config-mergeRT.txt",
+        barcode_fastq = f"{SPLITCODE_DIR}/{{sample}}/barcode_corrected.fastq.gz"
+    output: f"{SPLITCODE_DIR}/{{sample}}/barcode_merged.fastq.gz"
+    threads: 16
+    log: "logs/merge_tags_{sample}.out"
+    conda: "envs/splitcode.yaml"
+    shell:
+        """
+        splitcode -c {input.config} -t {threads} --gzip -o {output} {input.barcode_fastq} > {log} 2>&1
+        """
+
+#---------- Short-read Splice Junctions ----------#
+
+rule star_index:
+    input:
+        genome=GENOME,
+        gtf=[ANNOTATION_GTF] if ANNOTATION_GTF else []
+    output:
+        directory(f"{RESOURCES_DIR}/star_index")
+    params:
+        # overhang = R1 length (140 bp) - 1
+        sjdb=f"--sjdbGTFfile {ANNOTATION_GTF} --sjdbOverhang 139" if ANNOTATION_GTF else ""
+    threads: 16
+    log:
+        "logs/star_index.out"
+    conda: "envs/star.yaml"
+    shell:
+        """
+        mkdir -p {output}
+        STAR --runMode genomeGenerate --runThreadN {threads} --genomeDir {output} \
+            --genomeFastaFiles {input.genome} {params.sjdb} \
+            --outFileNamePrefix {output}/ > {log} 2>&1
+        """
+
+rule star_junctions:
+    input:
+        index=f"{RESOURCES_DIR}/star_index",
+        reads=SHORT_READS_R1
+    output:
+        f"{STAR_DIR}/SJ.out.tab"
+    params:
+        prefix=f"{STAR_DIR}/",
+        reads=",".join(SHORT_READS_R1)
+    threads: 16
+    log:
+        "logs/star_junctions.out"
+    conda: "envs/star.yaml"
+    shell:
+        """
+        STAR --runThreadN {threads} --genomeDir {input.index} \
+            --readFilesIn {params.reads} --readFilesCommand zcat \
+            --outSAMtype None --outFileNamePrefix {params.prefix} > {log} 2>&1
+        """
+
+#---------- Build Transcriptome ----------#
+
+rule genome_align:
+    input:
+        genome=GENOME,
+        reads=expand(f"{SPLITCODE_DIR}/{{sample}}/cDNA_corrected.fastq.gz", sample=SAMPLES)
+    output:
+        bam=f"{FLAIR_DIR}/flair.aligned.bam",
+        bai=f"{FLAIR_DIR}/flair.aligned.bam.bai",
+        bed=temp(f"{FLAIR_DIR}/flair.aligned.bed")
+    params:
+        prefix=f"{FLAIR_DIR}/flair.aligned"
+    threads: 32
+    log:
+        "logs/genome_align.out"
+    conda: "envs/flair.yaml"
+    shell:
+        "flair align -g {input.genome} -r {input.reads} -o {params.prefix} -t {threads} > {log} 2>&1"
+
+rule build_transcriptome:
+    input:
+        bam=f"{FLAIR_DIR}/flair.aligned.bam",
+        bai=f"{FLAIR_DIR}/flair.aligned.bam.bai",
+        genome=GENOME,
+        junctions=f"{STAR_DIR}/SJ.out.tab",
+        gtf=[ANNOTATION_GTF] if ANNOTATION_GTF else []
+    output:
+        gtf=f"{FLAIR_DIR}/flair.isoforms.gtf",
+        bed=f"{FLAIR_DIR}/flair.isoforms.bed",
+        fasta=f"{FLAIR_DIR}/flair.isoforms.fa",
+        read_map=f"{FLAIR_DIR}/flair.isoform.read.map.txt",
+        counts=f"{FLAIR_DIR}/flair.isoform.counts.txt"
+    params:
+        prefix=f"{FLAIR_DIR}/flair",
+        annotation=f"-f {ANNOTATION_GTF}" if ANNOTATION_GTF else ""
+    threads: 32
+    log:
+        "logs/build_transcriptome.out"
+    conda: "envs/flair.yaml"
+    shell:
+        """
+        flair transcriptome -b {input.bam} -g {input.genome} --junction_tab {input.junctions} \
+            {params.annotation} -o {params.prefix} -t {threads} > {log} 2>&1
+        """
+
+#---------- lr-kallisto Quantification ----------#
+rule kallisto_index:
+    input:
+        genome=GENOME,
+        gtf=f"{FLAIR_DIR}/flair.isoforms.gtf"
+    output:
+        index=f"{KALLISTO_DIR}/index.idx",
+        t2g=f"{KALLISTO_DIR}/t2g.txt",
+        fasta=temp(f"{KALLISTO_DIR}/fasta.fa")
+    threads: 32
+    log:
+        "logs/kallisto_index.out"
+    conda: "envs/kb_python.yaml"
+    shell:
+        """
+        kb ref -k 63 -i {output.index} -g {output.t2g} -f1 {output.fasta} -t {threads} \
+            {input.genome} {input.gtf} > {log} 2>&1
+        """
+
+rule kallisto_count:
+    input:
+        index=f"{KALLISTO_DIR}/index.idx",
+        t2g=f"{KALLISTO_DIR}/t2g.txt",
+        barcode_fastq = f"{SPLITCODE_DIR}/{{sample}}/barcode_merged.fastq.gz",
+        cdna_fastq = f"{SPLITCODE_DIR}/{{sample}}/cDNA_corrected.fastq.gz",
+        umi_fastq = f"{SPLITCODE_DIR}/{{sample}}/umi_corrected.fastq.gz"
+    output:
+        dir=directory(f"{KALLISTO_DIR}/{{sample}}")
+    threads: 16
+    log:
+        "logs/kallisto_count_{sample}.out"
+    conda: "envs/kb_python.yaml"
+    shell:
+        """
+        kb count -k 63 --long --platform ONT --threshold 0.8 -x '2,0,24:1,0,10:0,0,0' \
+            -i {input.index} -g {input.t2g} -o {output.dir} --h5ad -t {threads} \
+            {input.cdna_fastq} {input.umi_fastq} {input.barcode_fastq} \
+            > {log} 2>&1
+        """

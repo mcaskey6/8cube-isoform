@@ -1,0 +1,8 @@
+resources/*
+logs/*
+results/*
+.snakemake/*
+test/*
+*.gz
+*.fastq*
+*workflow/data/*

@@ -1,0 +1,6 @@
+@extract <barcode_corrected{*}>
+tags	distances	ids	groups	minFindsG	locations
+/home/mcaskey/8cube_isoform/workflow/configs/onlists/r1_R.txt$	1:1:1	r1_R	round1	1	2,16,24
+/home/mcaskey/8cube_isoform/workflow/configs/onlists/r1_T.txt$	1:1:1	r1_T	round1	1	2,16,24
+/home/mcaskey/8cube_isoform/workflow/configs/onlists/r2_3.txt$	1:1:1	r2	round2_3	2	2,8,16
+/home/mcaskey/8cube_isoform/workflow/configs/onlists/r2_3.txt$	1:1:1	r3	round2_3	2	2,0,8

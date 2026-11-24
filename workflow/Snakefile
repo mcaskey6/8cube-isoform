@@ -15,6 +15,10 @@ SAMPLES, = glob_wildcards(DATA_DIR + "{sample,[^/]+}.fastq.gz")
 NOVA_RUNS, NOVA_LIBS = glob_wildcards(RUN_DIR + "{run,nova[^/]*}/{lib,[^/]+}L001_R1_001.fastq.gz")
 SHORT_READS_R1 = sorted(expand(RUN_DIR + "{run}/{lib}L001_R1_001.fastq.gz", zip, run=NOVA_RUNS, lib=NOVA_LIBS))
 
+# Barcodes with fewer UMIs are dropped before transcript quantification, which runs per barcode
+# (most barcodes are near-empty). Override with --config min_umis=...
+MIN_UMIS = config.get("min_umis", 100)
+
 # Directories
 CONFIG_DIR = os.path.join(workflow.basedir, "configs")
 RESOURCES_DIR = "resources"
@@ -22,6 +26,7 @@ SPLITCODE_DIR = "results/splitcode"
 STAR_DIR = "results/star"
 FLAIR_DIR = "results/flair"
 KALLISTO_DIR = "results/kallisto"
+SQANTI3_DIR = "results/sqanti3"
 
 # C57BL/6 T2T genome (T2T_mhaESC_v1.5: chr1-19, X, Y, MT). NCBI has no annotation for it,
 # so GENCODE is lifted over from GRCm39.
@@ -33,7 +38,8 @@ GENCODE_GENOME = f"{RESOURCES_DIR}/gencode/GRCm39.primary_assembly.genome.fa"
 GENCODE_GTF = f"{RESOURCES_DIR}/gencode/gencode.v{GENCODE_RELEASE}.primary_assembly.annotation.gtf"
 
 # GTF used by STAR and FLAIR; set to None to run both without an annotation (skips liftoff)
-ANNOTATION_GTF = f"{RESOURCES_DIR}/genome/t2t_liftoff.gtf"
+ANNOTATION_GTF = f"{RESOURCES_DIR}/genome/t2t_liftoff.phased.gtf"
+LIFTOFF_GTF = f"{RESOURCES_DIR}/genome/t2t_liftoff.gtf"
 
 # General parameters for splitcode filtering
 SEQUENCES = ["cDNA", "umi", "barcode"]
@@ -103,7 +109,7 @@ rule liftoff:
         gtf=GENCODE_GTF,
         chroms=f"{RESOURCES_DIR}/genome/chroms.csv"
     output:
-        gtf=ANNOTATION_GTF,
+        gtf=LIFTOFF_GTF,
         unmapped=f"{RESOURCES_DIR}/genome/t2t_liftoff_unmapped.txt"
     params:
         tmpdir=f"{RESOURCES_DIR}/liftoff_intermediate"
@@ -120,6 +126,20 @@ rule liftoff:
          rm -rf {params.tmpdir}) > {log} 2>&1
         """
 
+# Liftoff writes "." as the phase of every feature; recompute CDS/start/stop codon phases
+# (gtfToGenePred -genePredExt, used by SQANTI3, rejects coding features without one)
+rule fix_cds_phases:
+    input:
+        source_gtf=GENCODE_GTF,
+        lifted_gtf=LIFTOFF_GTF
+    output: ANNOTATION_GTF
+    resources:
+        mem_mb=4000
+    log:
+        "logs/fix_cds_phases.out"
+    script:
+        "scripts/fix_cds_phases.py"
+
 #---------- Process Nanopore Data ----------#
 
 rule generate_config:
@@ -132,8 +152,11 @@ rule generate_config:
     conda: "envs/seqspec.yaml"
     shell:
         """
+        # Keep only the forward (f) and reverse-complement (rc) orientations. Then flip the cDNA
+        # extracts: as written, cDNA is read from the RT primer onward (first-strand cDNA, antisense
+        # to the mRNA), which puts FLAIR's single-exon isoforms on the wrong strand.
         (seqspec index -m rna -s read -i nanopore_read -t splitcode {input.ont_seqspec} > {output.ont_config} &&
-         sed -i -E '/<~c_|<r_/d; /\tlinker-[0-9]+[cr]\t/d' {output.ont_config}) 2> {log}
+         sed -i -E '/<~c_|<r_/d; /\tlinker-[0-9]+[cr]\t/d; s/<f_cDNA>/<~f_cDNA>/; s/<~rc_cDNA>/<rc_cDNA>/' {output.ont_config}) 2> {log}
         """
 
 def get_fastq_path(wildcards):
@@ -200,7 +223,7 @@ rule correct_barcodes:
         barcode_fastq = temp(f"{SPLITCODE_DIR}/{{sample}}/barcode_corrected.fastq.gz"),
         cdna_fastq = f"{SPLITCODE_DIR}/{{sample}}/cDNA_corrected.fastq.gz",
         umi_fastq = f"{SPLITCODE_DIR}/{{sample}}/umi_corrected.fastq.gz",
-        # uncorrected barcodes of the kept reads; splitcode 0.31.6 rejects --select with fewer outputs than inputs
+        # uncorrected barcodes of the kept reads (unused; splitcode needs one output per input file)
         filtered_fastq = temp(f"{SPLITCODE_DIR}/{{sample}}/barcode_filtered.fastq.gz")
     params:
         outdir = f"{SPLITCODE_DIR}/{{sample}}",
@@ -224,6 +247,38 @@ rule correct_barcodes:
          splitcode -c "$config" --nFastqs=3 -t {threads} --gzip \
             -o cDNA_corrected.fastq.gz,umi_corrected.fastq.gz,barcode_filtered.fastq.gz \
             "$cdna_fastq" "$umi_fastq" "$barcode_fastq") > {log} 2>&1
+        """
+
+rule extract_polyT:
+    input:
+        config = f"{CONFIG_DIR}/config-RT-polyT.txt",
+        onlist = f"{CONFIG_DIR}/onlists/r1_T.txt",
+        barcode_fastq = f"{SPLITCODE_DIR}/{{sample}}/barcode_corrected.fastq.gz",
+        cdna_fastq = f"{SPLITCODE_DIR}/{{sample}}/cDNA_corrected.fastq.gz",
+        umi_fastq = f"{SPLITCODE_DIR}/{{sample}}/umi_corrected.fastq.gz"
+    output:
+        barcode_fastq = f"{SPLITCODE_DIR}/{{sample}}/barcode_polyT.fastq.gz",
+        cdna_fastq = f"{SPLITCODE_DIR}/{{sample}}/cDNA_polyT.fastq.gz",
+        umi_fastq = f"{SPLITCODE_DIR}/{{sample}}/umi_polyT.fastq.gz"
+    threads: 16
+    resources:
+        mem_mb=4000
+    params:
+        onlist_dir = f"{CONFIG_DIR}/onlists"
+    log: "logs/extract_polyT_{sample}.out"
+    conda: "envs/splitcode.yaml"
+    shell:
+        r"""
+        # config-RT-polyT.txt names the onlist without a directory; give splitcode a copy with the full path
+        config=$(mktemp)
+        keep=$(mktemp)
+        trap 'rm -f "$config" "$keep"' EXIT
+        sed -E "s#^([^[:space:]]+\.txt[$])#{params.onlist_dir}/\1#" {input.config} > "$config"
+        echo polyT > "$keep"
+
+        splitcode -c "$config" --keep-grp "$keep" --nFastqs=3 -t {threads} --gzip \
+            -o {output.cdna_fastq},{output.umi_fastq},{output.barcode_fastq} \
+            {input.cdna_fastq} {input.umi_fastq} {input.barcode_fastq} > {log} 2>&1
         """
 
 rule merge_tags:
@@ -293,7 +348,7 @@ rule star_junctions:
 rule genome_align:
     input:
         genome=GENOME,
-        reads=expand(f"{SPLITCODE_DIR}/{{sample}}/cDNA_corrected.fastq.gz", sample=SAMPLES)
+        reads=expand(f"{SPLITCODE_DIR}/{{sample}}/cDNA_polyT.fastq.gz", sample=SAMPLES)
     output:
         bam=f"{FLAIR_DIR}/flair.aligned.bam",
         bai=f"{FLAIR_DIR}/flair.aligned.bam.bai",
@@ -337,11 +392,135 @@ rule build_transcriptome:
             {params.annotation} -o {params.prefix} -t {threads} > {log} 2>&1
         """
 
+rule unique_isoform_ids:
+    # FLAIR's GTF can reuse a read-named transcript_id in different genes, but SQANTI3 and kb ref
+    # need unique IDs. Rename every transcript to FLAIR's own unique "{transcript}_{gene}" name,
+    # as used in flair.isoforms.{bed,fa} and the FLAIR counts.
+    input: f"{FLAIR_DIR}/flair.isoforms.gtf"
+    output: f"{FLAIR_DIR}/flair.isoforms.unique_ids.gtf"
+    shell:
+        r"""
+        awk 'BEGIN {{ FS = OFS = "\t" }}
+             match($9, /gene_id "[^"]+"/) {{
+                 gene = substr($9, RSTART + 9, RLENGTH - 10)
+                 if (match($9, /transcript_id "[^"]+"/))
+                     $9 = substr($9, 1, RSTART + RLENGTH - 2) "_" gene substr($9, RSTART + RLENGTH - 1)
+             }}
+             {{ print }}' {input} > {output}
+        """
+
+#---------- Transcriptome QC and Filtering ----------#
+rule sqanti3:
+    input:
+        flair_gtf=f"{FLAIR_DIR}/flair.isoforms.unique_ids.gtf",
+        ref_gtf=ANNOTATION_GTF,
+        genome=GENOME,
+        junctions=f"{STAR_DIR}/SJ.out.tab"
+    output:
+        classification=f"{SQANTI3_DIR}/flair_classification.txt",
+        junctions=f"{SQANTI3_DIR}/flair_junctions.txt",
+        corrected_gtf=f"{SQANTI3_DIR}/flair_corrected.gtf",
+        corrected_fasta=f"{SQANTI3_DIR}/flair_corrected.fasta",
+        filter_classification=f"{SQANTI3_DIR}/flair_RulesFilter_classification.txt",
+        filtered_gtf=f"{SQANTI3_DIR}/flair.filtered.gtf"
+    params:
+        dir=SQANTI3_DIR,
+        prefix="flair",
+        chunks=8
+    threads: 32
+    resources:
+        mem_mb=64000
+    log:
+        "logs/sqanti3.out"
+    conda: "envs/sqanti3.yaml"
+    shell:
+        """
+        # SQANTI3 reuses files it finds in its chunk folders, including incomplete ones from an
+        # interrupted run, so start from a clean folder
+        rm -rf {params.dir}/{params.prefix}_splits
+        config=$(mktemp --suffix .yaml)
+        trap 'rm -f "$config"' EXIT
+        (sqanti3 init -c "$config" -a \
+            isoforms={input.flair_gtf} refGTF={input.ref_gtf} refFasta={input.genome} \
+            coverage={input.junctions} dir={params.dir} output={params.prefix} \
+            cpus=$(( {threads} / {params.chunks} )) chunks={params.chunks}
+         sqanti3 qc -c "$config"
+         sqanti3 filter -c "$config") > {log} 2>&1
+        """
+
+rule sqanti3_reference_qc:
+    # SQANTI3 QC of the reference annotation itself (refClassif), needed by full-mode rescue to
+    # judge which reference transcripts can replace discarded artifacts. Depends only on the
+    # reference, so it lives in resources/. Each transcript is a full-splice match of itself.
+    input:
+        ref_gtf=ANNOTATION_GTF,
+        genome=GENOME
+    output:
+        f"{RESOURCES_DIR}/sqanti3_reference/reference_classification.txt"
+    params:
+        dir=f"{RESOURCES_DIR}/sqanti3_reference",
+        prefix="reference",
+        chunks=8
+    threads: 32
+    resources:
+        mem_mb=64000
+    log:
+        "logs/sqanti3_reference_qc.out"
+    conda: "envs/sqanti3.yaml"
+    shell:
+        """
+        # SQANTI3 reuses files it finds in its chunk folders, including incomplete ones from an
+        # interrupted run, so start from a clean folder
+        rm -rf {params.dir}/{params.prefix}_splits
+        config=$(mktemp --suffix .yaml)
+        trap 'rm -f "$config"' EXIT
+        (sqanti3 init -c "$config" -a \
+            isoforms={input.ref_gtf} refGTF={input.ref_gtf} refFasta={input.genome} \
+            dir={params.dir} output={params.prefix} report=skip \
+            cpus=$(( {threads} / {params.chunks} )) chunks={params.chunks}
+         sqanti3 qc -c "$config") > {log} 2>&1
+        """
+
+rule sqanti3_rescue:
+    # Full-mode rescue: automatic rescue of full-splice-match artifacts, plus mapping of the other
+    # artifacts (ISM, NIC, NNC) to reference and kept isoforms; reference transcripts that pass the
+    # same rules are added back, so genes whose isoforms were all filtered keep a quantification
+    # target. Requantification is skipped: it redistributes SQANTI3's own counts, and we use kallisto.
+    input:
+        filter_classification=f"{SQANTI3_DIR}/flair_RulesFilter_classification.txt",
+        filtered_gtf=f"{SQANTI3_DIR}/flair.filtered.gtf",
+        corrected_fasta=f"{SQANTI3_DIR}/flair_corrected.fasta",
+        ref_classification=f"{RESOURCES_DIR}/sqanti3_reference/reference_classification.txt",
+        ref_gtf=ANNOTATION_GTF,
+        genome=GENOME
+    output:
+        gtf=f"{SQANTI3_DIR}/flair_rescued.gtf"
+    params:
+        dir=SQANTI3_DIR,
+        prefix="flair"
+    threads: 32
+    resources:
+        mem_mb=32000
+    log:
+        "logs/sqanti3_rescue.out"
+    conda: "envs/sqanti3.yaml"
+    shell:
+        """
+        config=$(mktemp --suffix .yaml)
+        trap 'rm -f "$config"' EXIT
+        (sqanti3 init -c "$config" -a \
+            refGTF={input.ref_gtf} refFasta={input.genome} dir={params.dir} output={params.prefix} \
+            filter_class={input.filter_classification} filtered_isoforms_gtf={input.filtered_gtf} \
+            corrected_isoforms_fasta={input.corrected_fasta} refClassif={input.ref_classification} \
+            mode=full skip_requant=true cpus={threads}
+         sqanti3 rescue -c "$config") > {log} 2>&1
+        """
+
 #---------- lr-kallisto Quantification ----------#
 rule kallisto_index:
     input:
         genome=GENOME,
-        gtf=f"{FLAIR_DIR}/flair.isoforms.gtf"
+        gtf=f"{SQANTI3_DIR}/flair_rescued.gtf"
     output:
         index=f"{KALLISTO_DIR}/index.idx",
         t2g=f"{KALLISTO_DIR}/t2g.txt",
@@ -367,6 +546,9 @@ rule kallisto_count:
         umi_fastq = f"{SPLITCODE_DIR}/{{sample}}/umi_corrected.fastq.gz"
     output:
         dir=directory(f"{KALLISTO_DIR}/{{sample}}")
+    params:
+        min_umis=MIN_UMIS,
+        filter_script=f"{workflow.basedir}/scripts/filter_barcodes.py"
     threads: 16
     resources:
         mem_mb=16000
@@ -376,7 +558,26 @@ rule kallisto_count:
     shell:
         """
         kb count -k 63 --long --platform ONT --threshold 0.8 -x '2,0,24:1,0,10:0,0,0' \
+            -w NONE --tcc \
             -i {input.index} -g {input.t2g} -o {output.dir} --h5ad -t {threads} \
             {input.cdna_fastq} {input.umi_fastq} {input.barcode_fastq} \
             > {log} 2>&1
+
+        # Drop near-empty barcodes: quant-tcc runs per barcode, and most of the barcodes in
+        # counts_unfiltered/ have only a few UMIs
+        unfiltered={output.dir}/counts_unfiltered/cells_x_tcc
+        filtered={output.dir}/counts_filtered/cells_x_tcc
+        mkdir -p {output.dir}/counts_filtered
+        python {params.filter_script} {params.min_umis} "$unfiltered.mtx" "$unfiltered.barcodes.txt" \
+            "$filtered.mtx" "$filtered.barcodes.txt" >> {log} 2>&1
+        cp "$unfiltered.ec.txt" "$filtered.ec.txt"
+
+        # kb only runs quant-tcc for bulk/Smart-seq, so run it here: resolves the cell x TCC matrix
+        # into cell x transcript abundances (quant/matrix.abundance.mtx; rows = counts_filtered barcodes).
+        # kallisto ships inside kb_python; k64 is the build that matches the k=63 index.
+        kallisto=$(python -c 'import kb_python, os; print(os.path.join(os.path.dirname(kb_python.__file__), "bins/linux/kallisto/kallisto_k64"))')
+        "$kallisto" quant-tcc --long -P ONT -t {threads} \
+            -i {output.dir}/index.saved -e "$filtered.ec.txt" \
+            -f {output.dir}/flens.txt -g {input.t2g} -o {output.dir}/quant \
+            "$filtered.mtx" >> {log} 2>&1
         """

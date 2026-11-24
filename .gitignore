@@ -3,7 +3,7 @@ logs/*
 results/*
 .snakemake/*
 test/*
+tmp/*
 *.gz
 *.fastq*
-*workflow/data/*
 CLAUDE.md

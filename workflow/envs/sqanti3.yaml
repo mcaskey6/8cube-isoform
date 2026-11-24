@@ -1,0 +1,8 @@
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - sqanti3=6.1
+  # Build of polars (used by SQANTI3 rescue) that also runs on CPUs without AVX2
+  - polars-lts-cpu=0.20.31

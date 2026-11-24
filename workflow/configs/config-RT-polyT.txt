@@ -1,0 +1,2 @@
+tags	distances	ids	groups	locations
+r1_T.txt$	0	r1_T	polyT	2,16,24
